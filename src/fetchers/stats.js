@@ -1,15 +1,16 @@
 // @ts-check
-
 import axios from "axios";
 import * as dotenv from "dotenv";
 import githubUsernameRegex from "github-username-regex";
 import { calculateRank } from "../calculateRank.js";
 import { retryer } from "../common/retryer.js";
-import { logger } from "../common/log.js";
-import { excludeRepositories } from "../common/envs.js";
-import { CustomError, MissingParamError } from "../common/error.js";
-import { wrapTextMultiline } from "../common/fmt.js";
-import { request } from "../common/http.js";
+import {
+  CustomError,
+  logger,
+  MissingParamError,
+  request,
+  wrapTextMultiline,
+} from "../common/utils.js";
 
 dotenv.config();
 
@@ -39,14 +40,12 @@ const GRAPHQL_REPOS_QUERY = `
 `;
 
 const GRAPHQL_STATS_QUERY = `
-  query userInfo($login: String!, $after: String, $includeMergedPullRequests: Boolean!, $includeDiscussions: Boolean!, $includeDiscussionsAnswers: Boolean!, $startTime: DateTime = null) {
+  query userInfo($login: String!, $after: String, $includeMergedPullRequests: Boolean!, $includeDiscussions: Boolean!, $includeDiscussionsAnswers: Boolean!) {
     user(login: $login) {
       name
       login
-      commits: contributionsCollection (from: $startTime) {
+      contributionsCollection {
         totalCommitContributions,
-      }
-      reviews: contributionsCollection {
         totalPullRequestReviewContributions
       }
       repositoriesContributedTo(first: 1, contributionTypes: [COMMIT, ISSUE, PULL_REQUEST, REPOSITORY]) {
@@ -79,11 +78,15 @@ const GRAPHQL_STATS_QUERY = `
 `;
 
 /**
+ * @typedef {import('axios').AxiosResponse} AxiosResponse Axios response.
+ */
+
+/**
  * Stats fetcher object.
  *
- * @param {object & { after: string | null }} variables Fetcher variables.
+ * @param {object} variables Fetcher variables.
  * @param {string} token GitHub token.
- * @returns {Promise<import('axios').AxiosResponse>} Axios response.
+ * @returns {Promise<AxiosResponse>} Axios response.
  */
 const fetcher = (variables, token) => {
   const query = variables.after ? GRAPHQL_REPOS_QUERY : GRAPHQL_STATS_QUERY;
@@ -102,12 +105,11 @@ const fetcher = (variables, token) => {
  * Fetch stats information for a given username.
  *
  * @param {object} variables Fetcher variables.
- * @param {string} variables.username GitHub username.
+ * @param {string} variables.username Github username.
  * @param {boolean} variables.includeMergedPullRequests Include merged pull requests.
  * @param {boolean} variables.includeDiscussions Include discussions.
  * @param {boolean} variables.includeDiscussionsAnswers Include discussions answers.
- * @param {string|undefined} variables.startTime Time to start the count of total commits.
- * @returns {Promise<import('axios').AxiosResponse>} Axios response.
+ * @returns {Promise<AxiosResponse>} Axios response.
  *
  * @description This function supports multi-page fetching if the 'FETCH_MULTI_PAGE_STARS' environment variable is set to true.
  */
@@ -116,7 +118,6 @@ const statsFetcher = async ({
   includeMergedPullRequests,
   includeDiscussions,
   includeDiscussionsAnswers,
-  startTime,
 }) => {
   let stats;
   let hasNextPage = true;
@@ -129,7 +130,6 @@ const statsFetcher = async ({
       includeMergedPullRequests,
       includeDiscussions,
       includeDiscussionsAnswers,
-      startTime,
     };
     let res = await retryer(fetcher, variables);
     if (res.data.errors) {
@@ -159,27 +159,6 @@ const statsFetcher = async ({
 };
 
 /**
- * Fetch total commits using the REST API.
- *
- * @param {object} variables Fetcher variables.
- * @param {string} token GitHub token.
- * @returns {Promise<import('axios').AxiosResponse>} Axios response.
- *
- * @see https://developer.github.com/v3/search/#search-commits
- */
-const fetchTotalCommits = (variables, token) => {
-  return axios({
-    method: "get",
-    url: `https://api.github.com/search/commits?q=author:${variables.login}`,
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/vnd.github.cloak-preview",
-      Authorization: `token ${token}`,
-    },
-  });
-};
-
-/**
  * Fetch all the commits for all the repositories of a given username.
  *
  * @param {string} username GitHub username.
@@ -188,21 +167,160 @@ const fetchTotalCommits = (variables, token) => {
  * @description Done like this because the GitHub API does not provide a way to fetch all the commits. See
  * #92#issuecomment-661026467 and #211 for more information.
  */
+// Fetch all the commits for all the repositories of a given username.
 const totalCommitsFetcher = async (username) => {
   if (!githubUsernameRegex.test(username)) {
     logger.log("Invalid username provided.");
     throw new Error("Invalid username provided.");
   }
 
+  const fetchTotalCommits = async (variables, token) => {
+    // REST request (old method)
+    let restRes;
+    try {
+      restRes = await axios({
+        method: "get",
+        url: `https://api.github.com/search/commits?q=author:${variables.login}`,
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/vnd.github.cloak-preview",
+          Authorization: `token ${token}`,
+        },
+      });
+    } catch (err) {
+      logger.error("REST /search/commits failed:", err.message || err);
+      throw new Error(err);
+    }
+
+    if (restRes?.data && restRes.data.error) {
+      throw new Error("Could not fetch total commits.");
+    }
+
+    let baselineTotal = restRes?.data?.total_count;
+
+    try {
+      // First get account created year using GraphQL
+      // Include createdAt so we can set start year.
+      const userQuery = `
+        query($login: String!) {
+          user(login: $login) {
+            createdAt
+          }
+        }
+      `;
+
+      const userRes = await axios({
+        method: "post",
+        url: "https://api.github.com/graphql",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        data: JSON.stringify({
+          query: userQuery,
+          variables: { login: variables.login },
+        }),
+      });
+
+      const createdAt = userRes?.data?.data?.user?.createdAt;
+      const startYear = createdAt ? new Date(createdAt).getFullYear() : null;
+      const currentYear = new Date().getFullYear();
+
+      // otherwise iterate years from startYear..currentYear.
+      const years = startYear
+        ? Array.from(
+            { length: currentYear - startYear + 1 },
+            (_, i) => startYear + i,
+          )
+        : [currentYear];
+
+      // GraphQL per-year query returns totalContributions for that year.
+      const gqlQuery = `
+        query($login: String!, $from: DateTime!, $to: DateTime!) {
+          user(login: $login) {
+            contributionsCollection(from: $from, to: $to) {
+              contributionCalendar {
+                totalContributions
+              }
+            }
+          }
+        }
+      `;
+
+      const yearPromises = years.map(async (y) => {
+        const from = `${y}-01-01T00:00:00Z`;
+        const to = `${y}-12-31T23:59:59Z`;
+        const res = await axios({
+          method: "post",
+          url: "https://api.github.com/graphql",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          data: JSON.stringify({
+            query: gqlQuery,
+            variables: { login: variables.login, from, to },
+          }),
+        });
+
+        return (
+          res?.data?.data?.user?.contributionsCollection?.contributionCalendar
+            ?.totalContributions || 0
+        );
+      });
+
+      const contributionsByYear = await Promise.all(yearPromises);
+      const totalContributions = contributionsByYear.reduce((a, b) => a + b, 0);
+
+      // If GraphQL returned a sensible total, use it by overriding restRes.data.total_count
+      if (
+        typeof totalContributions === "number" &&
+        !isNaN(totalContributions)
+      ) {
+        restRes.data.total_count = totalContributions;
+        return restRes;
+      }
+      // otherwise, fall through to return restRes baseline
+    } catch (err) {
+      logger.error(
+        "GraphQL-based commit aggregation failed, falling back to REST:",
+        err.response?.data || err.message || err,
+      );
+    }
+
+    // If REST baseline exists and is numeric, return the REST response.
+    if (typeof baselineTotal === "number" && !isNaN(baselineTotal)) {
+      return restRes;
+    }
+
+    // Nothing worked
+    throw new CustomError(
+      "Could not fetch total commits.",
+      CustomError.GITHUB_REST_API_ERROR,
+    );
+  };
+
   let res;
   try {
     res = await retryer(fetchTotalCommits, { login: username });
   } catch (err) {
+    console.log(err);
     logger.log(err);
-    throw new Error(err);
+    throw new CustomError(
+      "Could not fetch total commits.",
+      CustomError.GITHUB_REST_API_ERROR,
+    );
   }
 
-  const totalCount = res.data.total_count;
+  if (!res || !res.data) {
+    throw new CustomError(
+      "Could not fetch total commits.",
+      CustomError.GITHUB_REST_API_ERROR,
+    );
+  }
+
+  const totalCount = res.data?.total_count;
+
   if (!totalCount || isNaN(totalCount)) {
     throw new CustomError(
       "Could not fetch total commits.",
@@ -213,6 +331,10 @@ const totalCommitsFetcher = async (username) => {
 };
 
 /**
+ * @typedef {import("./types").StatsData} StatsData Stats data.
+ */
+
+/**
  * Fetch stats for a given username.
  *
  * @param {string} username GitHub username.
@@ -221,8 +343,7 @@ const totalCommitsFetcher = async (username) => {
  * @param {boolean} include_merged_pull_requests Include merged pull requests.
  * @param {boolean} include_discussions Include discussions.
  * @param {boolean} include_discussions_answers Include discussions answers.
- * @param {number|undefined} commits_year Year to count total commits
- * @returns {Promise<import("./types").StatsData>} Stats data.
+ * @returns {Promise<StatsData>} Stats data.
  */
 const fetchStats = async (
   username,
@@ -231,7 +352,6 @@ const fetchStats = async (
   include_merged_pull_requests = false,
   include_discussions = false,
   include_discussions_answers = false,
-  commits_year,
 ) => {
   if (!username) {
     throw new MissingParamError(["username"]);
@@ -257,7 +377,6 @@ const fetchStats = async (
     includeMergedPullRequests: include_merged_pull_requests,
     includeDiscussions: include_discussions,
     includeDiscussionsAnswers: include_discussions_answers,
-    startTime: commits_year ? `${commits_year}-01-01T00:00:00Z` : undefined,
   });
 
   // Catch GraphQL errors.
@@ -289,17 +408,17 @@ const fetchStats = async (
   if (include_all_commits) {
     stats.totalCommits = await totalCommitsFetcher(username);
   } else {
-    stats.totalCommits = user.commits.totalCommitContributions;
+    stats.totalCommits = user.contributionsCollection.totalCommitContributions;
   }
 
   stats.totalPRs = user.pullRequests.totalCount;
   if (include_merged_pull_requests) {
     stats.totalPRsMerged = user.mergedPullRequests.totalCount;
     stats.mergedPRsPercentage =
-      (user.mergedPullRequests.totalCount / user.pullRequests.totalCount) *
-        100 || 0;
+      (user.mergedPullRequests.totalCount / user.pullRequests.totalCount) * 100;
   }
-  stats.totalReviews = user.reviews.totalPullRequestReviewContributions;
+  stats.totalReviews =
+    user.contributionsCollection.totalPullRequestReviewContributions;
   stats.totalIssues = user.openIssues.totalCount + user.closedIssues.totalCount;
   if (include_discussions) {
     stats.totalDiscussionsStarted = user.repositoryDiscussions.totalCount;
@@ -311,8 +430,7 @@ const fetchStats = async (
   stats.contributedTo = user.repositoriesContributedTo.totalCount;
 
   // Retrieve stars while filtering out repositories to be hidden.
-  const allExcludedRepos = [...exclude_repo, ...excludeRepositories];
-  let repoToHide = new Set(allExcludedRepos);
+  let repoToHide = new Set(exclude_repo);
 
   stats.totalStars = user.repositories.nodes
     .filter((data) => {
